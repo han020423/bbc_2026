@@ -31,12 +31,18 @@ class TrackDriverNode(Node):
 
         # Yellow dashed centerline first, white solid-line fallback.
         self.KP = 0.58
-        self.BASE_SPEED = 16.0
-        self.MID_SPEED = 10.0
+        self.BASE_SPEED = 18.0
+        self.MID_SPEED = 12.0
         self.CURVE_SPEED = 5.0
         self.LOST_SPEED = 0.0
         self.DEADBAND_PX = 10.0
         self.MAX_ANGLE_DELTA = 35.0
+        self.CURVE_HOLD_FRAMES = 12
+        self.SHARP_CURVE_HOLD_FRAMES = 6
+        self.CURVE_HEADING_DEG = 18.0
+        self.CURVE_QUADRATIC = 0.0015
+        self.SHARP_CURVE_HEADING_DEG = 30.0
+        self.SHARP_CURVE_QUADRATIC = 0.0040
 
         self.ROI_TOP_RATIO = 0.55
         self.ROI_BOTTOM_RATIO = 0.99
@@ -46,7 +52,7 @@ class TrackDriverNode(Node):
         self.MIN_FIT_PIXELS = 45
         self.YELLOW_MIN_FIT_PIXELS = 45
         self.MIN_BOTTOM_HITS = 1
-        self.LANE_WIDTH_PX = 285.0
+        self.LANE_WIDTH_PX = 400.0
         self.YELLOW_MIN_PEAK = 260
         self.WHITE_MIN_PEAK = 420
 
@@ -54,6 +60,8 @@ class TrackDriverNode(Node):
         self.white_fit = None
         self.center_fit = None
         self.last_angle = 0.0
+        self.curve_hold_remaining = 0
+        self.sharp_curve_hold_remaining = 0
         self.fail_count = 0
         self.frame_count = 0
 
@@ -85,8 +93,16 @@ class TrackDriverNode(Node):
         height, width = image.shape[:2]
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        yellow_mask = cv2.inRange(hsv, np.array([15, 55, 70]), np.array([43, 255, 255]))
-        white_mask = cv2.inRange(hsv, np.array([0, 0, 140]), np.array([180, 120, 255]))
+        # Simulator lane colors: keep only vivid yellow and near-neutral white.
+        yellow_mask = cv2.inRange(hsv, np.array([18, 125, 150]), np.array([40, 255, 255]))
+        white_mask = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 50, 255]))
+
+        # A lane marking must touch the gray road surface. This removes white
+        # trees and other bright objects surrounded by green scenery.
+        road_mask = cv2.inRange(hsv, np.array([0, 0, 30]), np.array([180, 40, 150]))
+        road_support = cv2.dilate(road_mask, np.ones((17, 17), np.uint8), iterations=1)
+        yellow_mask = cv2.bitwise_and(yellow_mask, road_support)
+        white_mask = cv2.bitwise_and(white_mask, road_support)
 
         top_y = int(height * self.ROI_TOP_RATIO)
         bottom_y = int(height * self.ROI_BOTTOM_RATIO)
@@ -257,28 +273,63 @@ class TrackDriverNode(Node):
             center_fit[2] -= self.LANE_WIDTH_PX * 0.50
         return center_fit
 
+    def make_virtual_opposite_fit(self, yellow_fit, yellow_side, white_fit, white_side):
+        # Debug only: show the opposite lane boundary when exactly one side is visible.
+        if yellow_fit is not None and white_fit is None:
+            virtual_fit = yellow_fit.copy()
+            shift = self.LANE_WIDTH_PX if yellow_side == "left" else -self.LANE_WIDTH_PX
+            virtual_fit[2] += shift
+            return virtual_fit, "virtual_white"
+
+        if white_fit is not None and yellow_fit is None:
+            virtual_fit = white_fit.copy()
+            shift = self.LANE_WIDTH_PX if white_side == "left" else -self.LANE_WIDTH_PX
+            virtual_fit[2] += shift
+            return virtual_fit, "virtual_yellow"
+
+        return None, ""
+
     def is_curve_from_fit(self, fit, width, height):
         y_target = int(height * 0.64)
-        y_bottom = height - 1
-        target_x = float(np.polyval(fit, y_target))
-        bottom_x = float(np.polyval(fit, y_bottom))
-        error = target_x - width / 2.0
         slope = 2.0 * fit[0] * y_target + fit[1]
         heading = float(np.degrees(np.arctan(slope)))
-        return abs(error) > 80.0 or abs(heading) > 12.0 or abs(self.last_angle) > 25.0
+        curvature = abs(float(fit[0]))
+        geometric_curve = (
+            abs(heading) > self.CURVE_HEADING_DEG or
+            curvature > self.CURVE_QUADRATIC
+        )
+
+        if geometric_curve:
+            self.curve_hold_remaining = self.CURVE_HOLD_FRAMES
+            return True
+        if self.curve_hold_remaining > 0:
+            self.curve_hold_remaining -= 1
+            return True
+        return False
 
     def is_sharp_curve_from_fit(self, fit, width, height):
         y_target = int(height * 0.64)
-        target_x = float(np.polyval(fit, y_target))
-        error = target_x - width / 2.0
         slope = 2.0 * fit[0] * y_target + fit[1]
         heading = float(np.degrees(np.arctan(slope)))
-        return abs(error) > 150.0 or abs(heading) > 24.0 or abs(self.last_angle) > 55.0
+        curvature = abs(float(fit[0]))
+        geometric_sharp_curve = (
+            abs(heading) > self.SHARP_CURVE_HEADING_DEG or
+            curvature > self.SHARP_CURVE_QUADRATIC
+        )
+
+        if geometric_sharp_curve:
+            self.sharp_curve_hold_remaining = self.SHARP_CURVE_HOLD_FRAMES
+            self.curve_hold_remaining = self.CURVE_HOLD_FRAMES
+            return True
+        if self.sharp_curve_hold_remaining > 0:
+            self.sharp_curve_hold_remaining -= 1
+            return True
+        return False
 
     def blend_center_with_white(self, yellow_fit, white_fit, white_side):
         white_center = self.make_center_from_white(white_fit, f"{white_side}_white")
-        # In curves, white solid line should dominate because dashed yellow can jump.
-        return 0.35 * yellow_fit + 0.65 * white_center
+        # In moderate curves, keep yellow as the main route and use white as support.
+        return 0.65 * yellow_fit + 0.35 * white_center
 
     def calculate_error(self, center_fit, width, height):
         y_target = int(height * 0.64)
@@ -300,9 +351,9 @@ class TrackDriverNode(Node):
         if mode == "lost":
             return self.LOST_SPEED
         abs_angle = abs(angle)
-        if abs_angle > 45.0:
+        if abs_angle > 60.0:
             return self.CURVE_SPEED
-        if abs_angle > 18.0:
+        if abs_angle > 25.0:
             return self.MID_SPEED
         return self.BASE_SPEED
 
@@ -328,8 +379,14 @@ class TrackDriverNode(Node):
             "yellow_fit": yellow_fit,
             "white_fit": white_fit,
             "center_fit": None,
+            "virtual_fit": None,
+            "virtual_kind": "",
             "mode": "lost",
         }
+
+        if yellow_fit is None or white_fit is None:
+            self.curve_hold_remaining = 0
+            self.sharp_curve_hold_remaining = 0
 
         if yellow_fit is not None:
             self.fail_count = 0
@@ -355,7 +412,12 @@ class TrackDriverNode(Node):
             self.white_fit = None
             self.center_fit = None
             self.last_angle = 0.0
+            self.curve_hold_remaining = 0
+            self.sharp_curve_hold_remaining = 0
             return 0.0, self.LOST_SPEED, debug
+
+        virtual_fit, virtual_kind = self.make_virtual_opposite_fit(
+            yellow_fit, yellow_side, white_fit, white_side)
 
         error, target_x, y_target = self.calculate_error(self.center_fit, width, height)
         angle = self.p_control(error)
@@ -363,6 +425,8 @@ class TrackDriverNode(Node):
 
         debug.update({
             "center_fit": self.center_fit,
+            "virtual_fit": virtual_fit,
+            "virtual_kind": virtual_kind,
             "center_target": target_x,
             "y_target": y_target,
             "error": error,
@@ -401,6 +465,21 @@ class TrackDriverNode(Node):
         if len(pts) >= 2:
             cv2.polylines(view, [np.array(pts, dtype=np.int32)], False, color, thickness)
 
+    def draw_dashed_fit(self, view, fit, color, thickness=2):
+        if fit is None:
+            return
+        height, width = view.shape[:2]
+        ys = np.linspace(int(height * self.ROI_TOP_RATIO), height - 1, 50)
+        xs = fit[0] * ys ** 2 + fit[1] * ys + fit[2]
+        pts = [
+            (int(np.clip(x, 0, width - 1)), int(y))
+            for x, y in zip(xs, ys)
+            if -width * 0.20 <= x < width * 1.20
+        ]
+        for index in range(0, len(pts) - 1, 6):
+            end = min(index + 3, len(pts) - 1)
+            cv2.line(view, pts[index], pts[end], color, thickness)
+
     def make_window_debug(self, yellow_mask, white_mask, yellow_lanes, white_lanes):
         combined = cv2.bitwise_or(yellow_mask, white_mask)
         debug = np.dstack((combined, combined, combined))
@@ -427,6 +506,7 @@ class TrackDriverNode(Node):
             self.draw_fit(view, fit, (180, 180, 180), 1)
         self.draw_fit(view, debug.get("yellow_fit"), (0, 255, 255), 3)
         self.draw_fit(view, debug.get("white_fit"), (255, 255, 255), 3)
+        self.draw_dashed_fit(view, debug.get("virtual_fit"), (255, 0, 255), 3)
         self.draw_fit(view, debug.get("center_fit"), (0, 0, 255), 4)
 
         if "center_target" in debug:
@@ -444,16 +524,18 @@ class TrackDriverNode(Node):
             (0, 255, 255),
             2,
         )
+        mode_text = f"mode={debug.get('mode')} err={debug.get('error', 0):.1f}"
+        if debug.get("virtual_kind"):
+            mode_text += f" {debug['virtual_kind']}"
         cv2.putText(
             view,
-            f"mode={debug.get('mode')} err={debug.get('error', 0):.1f}",
+            mode_text,
             (15, 62),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             (0, 255, 255),
             2,
         )
-
         cv2.imshow("track_drive camera debug", view)
         cv2.imshow("yellow white sliding windows", self.make_window_debug(
             debug["yellow_mask"], debug["white_mask"], debug["yellow_lanes"], debug["white_lanes"]))

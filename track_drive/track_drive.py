@@ -31,9 +31,17 @@ class TrackDriverNode(Node):
 
         # Yellow dashed centerline first, white solid-line fallback.
         self.KP = 0.58
-        self.BASE_SPEED = 18.0
-        self.MID_SPEED = 12.0
-        self.CURVE_SPEED = 5.0
+        self.YELLOW_CENTER_KP = 0.25
+        self.YELLOW_D_GAIN = 0.55
+        self.YELLOW_D_FILTER_ALPHA = 0.18
+        self.YELLOW_D_MAX = 18.0
+        self.BASE_SPEED = 22.0
+        self.MID_SPEED = 14.0
+        self.CURVE_SPEED = 6.0
+        self.SCHOOL_ZONE_SPEED = 6.0
+        self.SPEED_ACCEL_FROM_SHARP = 0.25
+        self.SPEED_ACCEL_FROM_MID = 0.60
+        self.SPEED_ACCEL_NORMAL = 0.80
         self.LOST_SPEED = 0.0
         self.DEADBAND_PX = 10.0
         self.MAX_ANGLE_DELTA = 35.0
@@ -43,6 +51,15 @@ class TrackDriverNode(Node):
         self.CURVE_QUADRATIC = 0.0015
         self.SHARP_CURVE_HEADING_DEG = 30.0
         self.SHARP_CURVE_QUADRATIC = 0.0040
+        self.WHITE_CURVE_ENTER_FRAMES = 4
+        self.WHITE_CURVE_EXIT_FRAMES = 6
+        self.WHITE_CURVE_MIN_HEADING_DEG = 30.0
+        self.WHITE_CURVE_COMBINED_HEADING_DEG = 22.0
+        self.WHITE_CURVE_COMBINED_QUADRATIC = 0.0020
+        self.WHITE_CURVE_WHITE_JUMP_PX = 40.0
+        self.SCHOOL_OUTER_BAND_RATIO = 0.28
+        self.SCHOOL_OUTER_MIN_PIXELS = 120
+        self.SCHOOL_OUTER_MIN_YSPAN = 60.0
 
         self.ROI_TOP_RATIO = 0.55
         self.ROI_BOTTOM_RATIO = 0.99
@@ -60,8 +77,16 @@ class TrackDriverNode(Node):
         self.white_fit = None
         self.center_fit = None
         self.last_angle = 0.0
+        self.last_command_speed = 0.0
+        self.prev_yellow_control_error = None
+        self.filtered_yellow_error_delta = 0.0
         self.curve_hold_remaining = 0
         self.sharp_curve_hold_remaining = 0
+        self.white_curve_active = False
+        self.sharp_curve_confirm_count = 0
+        self.straight_confirm_count = 0
+        self.sharp_curve_direction = 0
+        self.prev_white_curve_candidate_x = None
         self.fail_count = 0
         self.frame_count = 0
 
@@ -265,6 +290,62 @@ class TrackDriverNode(Node):
         side = "left" if x_eval < width / 2.0 else "right"
         return lane, fit, side, lanes, fits
 
+    def detect_school_zone_outer_yellow(self, yellow_mask, top_y, bottom_y):
+        """Detect the two long outer yellow boundaries of a school zone."""
+        height, width = yellow_mask.shape[:2]
+        band = int(width * self.SCHOOL_OUTER_BAND_RATIO)
+
+        def support(region):
+            ys, _ = region.nonzero()
+            if len(ys) == 0:
+                return 0, 0.0
+            return len(ys), float(np.max(ys) - np.min(ys))
+
+        left_region = yellow_mask[top_y:bottom_y, :band]
+        right_region = yellow_mask[top_y:bottom_y, width - band:width]
+        left_count, left_span = support(left_region)
+        right_count, right_span = support(right_region)
+        detected = (
+            left_count >= self.SCHOOL_OUTER_MIN_PIXELS and
+            right_count >= self.SCHOOL_OUTER_MIN_PIXELS and
+            left_span >= self.SCHOOL_OUTER_MIN_YSPAN and
+            right_span >= self.SCHOOL_OUTER_MIN_YSPAN
+        )
+        return detected, left_count, right_count
+
+    def find_school_center_yellow(self, yellow_mask, top_y, bottom_y, width, height):
+        """Track the dashed yellow marking seeded at the image center."""
+        lane = self.track_one_lane(yellow_mask, width // 2, top_y, bottom_y)
+        fit = self.fit_lane(
+            lane,
+            min_pixels=self.YELLOW_MIN_FIT_PIXELS,
+            require_bottom=False,
+        )
+        if fit is None:
+            return None, None, None
+        y_reference = int(height * 0.64)
+        x_reference = float(np.polyval(fit, y_reference))
+        if abs(x_reference - width / 2.0) > width * 0.22:
+            return None, None, None
+        side = "left" if x_reference < width / 2.0 else "right"
+        return lane, fit, side
+
+    def select_center_yellow(self, lanes, fits, width, height):
+        """Pick the valid yellow marking closest to the image center."""
+        y_reference = int(height * 0.64)
+        candidates = []
+        for lane, fit in zip(lanes, fits):
+            if fit is None:
+                continue
+            x_reference = float(np.polyval(fit, y_reference))
+            if -width * 0.15 <= x_reference <= width * 1.15:
+                candidates.append((abs(x_reference - width / 2.0), lane, fit, x_reference))
+        if not candidates:
+            return None, None, None
+        _, lane, fit, x_reference = min(candidates, key=lambda item: item[0])
+        side = "left" if x_reference < width / 2.0 else "right"
+        return lane, fit, side
+
     def make_center_from_white(self, white_fit, side):
         center_fit = white_fit.copy()
         if side == "left_white":
@@ -288,6 +369,78 @@ class TrackDriverNode(Node):
             return virtual_fit, "virtual_yellow"
 
         return None, ""
+
+    def curve_metrics(self, fit, height):
+        if fit is None:
+            return 0.0, 0.0
+        y_target = int(height * 0.64)
+        slope = 2.0 * fit[0] * y_target + fit[1]
+        heading = float(np.degrees(np.arctan(slope)))
+        return heading, abs(float(fit[0]))
+
+    def curve_geometry_label(self, heading, quadratic):
+        if (abs(heading) > self.SHARP_CURVE_HEADING_DEG or
+                quadratic > self.SHARP_CURVE_QUADRATIC):
+            return "sharp"
+        if abs(heading) > self.CURVE_HEADING_DEG or quadratic > self.CURVE_QUADRATIC:
+            return "curve"
+        return "straight"
+
+    def update_white_curve_mode(self, yellow_fit, white_fit, height):
+        """Enter white mode only after persistent sharp geometry and white continuity."""
+        if yellow_fit is None or white_fit is None:
+            self.white_curve_active = False
+            self.sharp_curve_confirm_count = 0
+            self.straight_confirm_count = 0
+            self.sharp_curve_direction = 0
+            self.prev_white_curve_candidate_x = None
+            return False
+
+        heading, quadratic = self.curve_metrics(yellow_fit, height)
+        raw_sharp = (
+            abs(heading) > self.WHITE_CURVE_MIN_HEADING_DEG or
+            (abs(heading) > self.WHITE_CURVE_COMBINED_HEADING_DEG and
+             quadratic > self.WHITE_CURVE_COMBINED_QUADRATIC)
+        )
+        raw_straight = (
+            abs(heading) <= self.CURVE_HEADING_DEG and
+            quadratic <= self.CURVE_QUADRATIC
+        )
+        direction = 1 if heading >= 0.0 else -1
+        y_reference = int(height * 0.64)
+        white_x = float(np.polyval(white_fit, y_reference))
+
+        if not self.white_curve_active:
+            white_continuous = (
+                self.prev_white_curve_candidate_x is None or
+                abs(white_x - self.prev_white_curve_candidate_x) <= self.WHITE_CURVE_WHITE_JUMP_PX
+            )
+            if raw_sharp and white_continuous:
+                if direction == self.sharp_curve_direction:
+                    self.sharp_curve_confirm_count += 1
+                else:
+                    self.sharp_curve_direction = direction
+                    self.sharp_curve_confirm_count = 1
+                self.prev_white_curve_candidate_x = white_x
+                if self.sharp_curve_confirm_count >= self.WHITE_CURVE_ENTER_FRAMES:
+                    self.white_curve_active = True
+                    self.straight_confirm_count = 0
+            else:
+                self.sharp_curve_confirm_count = 0
+                self.sharp_curve_direction = 0
+                self.prev_white_curve_candidate_x = white_x if raw_sharp else None
+            return self.white_curve_active
+
+        if raw_straight:
+            self.straight_confirm_count += 1
+            if self.straight_confirm_count >= self.WHITE_CURVE_EXIT_FRAMES:
+                self.white_curve_active = False
+                self.sharp_curve_confirm_count = 0
+                self.sharp_curve_direction = 0
+                self.prev_white_curve_candidate_x = None
+        else:
+            self.straight_confirm_count = 0
+        return self.white_curve_active
 
     def is_curve_from_fit(self, fit, width, height):
         y_target = int(height * 0.64)
@@ -326,11 +479,6 @@ class TrackDriverNode(Node):
             return True
         return False
 
-    def blend_center_with_white(self, yellow_fit, white_fit, white_side):
-        white_center = self.make_center_from_white(white_fit, f"{white_side}_white")
-        # In moderate curves, keep yellow as the main route and use white as support.
-        return 0.65 * yellow_fit + 0.35 * white_center
-
     def calculate_error(self, center_fit, width, height):
         y_target = int(height * 0.64)
         target_x = float(np.polyval(center_fit, y_target))
@@ -338,20 +486,50 @@ class TrackDriverNode(Node):
         error = float(np.clip(target_x - width / 2.0, -180.0, 180.0))
         return error, target_x, y_target
 
-    def p_control(self, error):
+    def p_control(self, error, mode):
         if abs(error) < self.DEADBAND_PX:
             error = 0.0
-        raw_angle = float(np.clip(self.KP * error, -self.MAX_ANGLE, self.MAX_ANGLE))
+
+        d_term = 0.0
+        if mode in ("yellow_center", "school_zone_yellow"):
+            if self.prev_yellow_control_error is None:
+                raw_error_delta = 0.0
+            else:
+                raw_error_delta = error - self.prev_yellow_control_error
+            alpha = self.YELLOW_D_FILTER_ALPHA
+            self.filtered_yellow_error_delta = (
+                (1.0 - alpha) * self.filtered_yellow_error_delta +
+                alpha * raw_error_delta
+            )
+            self.prev_yellow_control_error = error
+            d_term = float(np.clip(
+                self.YELLOW_D_GAIN * self.filtered_yellow_error_delta,
+                -self.YELLOW_D_MAX,
+                self.YELLOW_D_MAX,
+            ))
+        else:
+            self.prev_yellow_control_error = None
+            self.filtered_yellow_error_delta = 0.0
+
+        p_gain = (
+            self.YELLOW_CENTER_KP
+            if mode in ("yellow_center", "school_zone_yellow")
+            else self.KP
+        )
+        raw_angle = float(np.clip(
+            p_gain * error + d_term, -self.MAX_ANGLE, self.MAX_ANGLE))
         delta = float(np.clip(raw_angle - self.last_angle, -self.MAX_ANGLE_DELTA, self.MAX_ANGLE_DELTA))
         angle = float(np.clip(self.last_angle + delta, -self.MAX_ANGLE, self.MAX_ANGLE))
         self.last_angle = angle
-        return angle
+        return angle, d_term
 
     def select_speed(self, angle, mode):
         if mode == "lost":
             return self.LOST_SPEED
+        if mode == "school_zone_yellow":
+            return self.SCHOOL_ZONE_SPEED
         abs_angle = abs(angle)
-        if abs_angle > 60.0:
+        if abs_angle > 70.0:
             return self.CURVE_SPEED
         if abs_angle > 25.0:
             return self.MID_SPEED
@@ -368,6 +546,23 @@ class TrackDriverNode(Node):
             white_mask, self.WHITE_MIN_PEAK, self.white_fit, top_y, bottom_y, width, height,
             min_pixels=self.MIN_FIT_PIXELS, require_bottom=False)
 
+        valid_yellow_count = sum(fit is not None for fit in yellow_fits)
+        outer_yellow_detected, school_left_pixels, school_right_pixels = (
+            self.detect_school_zone_outer_yellow(yellow_mask, top_y, bottom_y)
+        )
+        school_zone_yellow = False
+        if outer_yellow_detected:
+            school_lane, school_fit, school_side = self.find_school_center_yellow(
+                yellow_mask, top_y, bottom_y, width, height)
+            if school_fit is not None:
+                yellow_lane, yellow_fit, yellow_side = school_lane, school_fit, school_side
+                yellow_lanes.append(school_lane)
+                yellow_fits.append(school_fit)
+                school_zone_yellow = True
+
+        curve_heading, curve_quadratic = self.curve_metrics(yellow_fit, height)
+        curve_geometry = self.curve_geometry_label(curve_heading, curve_quadratic)
+
         debug = {
             "yellow_mask": yellow_mask,
             "white_mask": white_mask,
@@ -381,6 +576,13 @@ class TrackDriverNode(Node):
             "center_fit": None,
             "virtual_fit": None,
             "virtual_kind": "",
+            "curve_heading": curve_heading,
+            "curve_quadratic": curve_quadratic,
+            "curve_geometry": curve_geometry,
+            "valid_yellow_count": valid_yellow_count,
+            "school_zone_detected": school_zone_yellow,
+            "school_left_pixels": school_left_pixels,
+            "school_right_pixels": school_right_pixels,
             "mode": "lost",
         }
 
@@ -392,12 +594,17 @@ class TrackDriverNode(Node):
             self.fail_count = 0
             self.yellow_fit = yellow_fit
             self.white_fit = white_fit
-            if white_fit is not None and self.is_sharp_curve_from_fit(yellow_fit, width, height):
+            if school_zone_yellow:
+                self.white_curve_active = False
+                self.sharp_curve_confirm_count = 0
+                self.straight_confirm_count = 0
+                self.sharp_curve_direction = 0
+                self.prev_white_curve_candidate_x = None
+                self.center_fit = yellow_fit.copy()
+                mode = "school_zone_yellow"
+            elif self.update_white_curve_mode(yellow_fit, white_fit, height):
                 self.center_fit = self.make_center_from_white(white_fit, f"{white_side}_white")
                 mode = "white_curve"
-            elif white_fit is not None and self.is_curve_from_fit(yellow_fit, width, height):
-                self.center_fit = self.blend_center_with_white(yellow_fit, white_fit, white_side)
-                mode = "yellow_white_curve"
             else:
                 self.center_fit = yellow_fit.copy()
                 mode = "yellow_center"
@@ -412,15 +619,22 @@ class TrackDriverNode(Node):
             self.white_fit = None
             self.center_fit = None
             self.last_angle = 0.0
+            self.prev_yellow_control_error = None
+            self.filtered_yellow_error_delta = 0.0
             self.curve_hold_remaining = 0
             self.sharp_curve_hold_remaining = 0
+            self.white_curve_active = False
+            self.sharp_curve_confirm_count = 0
+            self.straight_confirm_count = 0
+            self.sharp_curve_direction = 0
+            self.prev_white_curve_candidate_x = None
             return 0.0, self.LOST_SPEED, debug
 
         virtual_fit, virtual_kind = self.make_virtual_opposite_fit(
             yellow_fit, yellow_side, white_fit, white_side)
 
         error, target_x, y_target = self.calculate_error(self.center_fit, width, height)
-        angle = self.p_control(error)
+        angle, d_term = self.p_control(error, mode)
         speed = self.select_speed(angle, mode)
 
         debug.update({
@@ -430,9 +644,48 @@ class TrackDriverNode(Node):
             "center_target": target_x,
             "y_target": y_target,
             "error": error,
+            "d_term": d_term,
+            "curve_heading": curve_heading,
+            "curve_quadratic": curve_quadratic,
+            "curve_geometry": curve_geometry,
+            "valid_yellow_count": valid_yellow_count,
+            "school_zone_detected": school_zone_yellow,
+            "school_left_pixels": school_left_pixels,
+            "school_right_pixels": school_right_pixels,
+            "white_curve_active": self.white_curve_active,
+            "sharp_confirm": self.sharp_curve_confirm_count,
+            "straight_confirm": self.straight_confirm_count,
             "mode": mode,
         })
         return angle, speed, debug
+
+    def apply_speed_recovery_ramp(self, requested_speed):
+        """Apply every deceleration immediately and recover each speed tier gradually."""
+        if requested_speed <= 0.0:
+            self.last_command_speed = 0.0
+            return 0.0
+
+        # Do not delay initial launch. Recovery limiting starts only after the
+        # vehicle has already been commanded to move.
+        if self.last_command_speed <= 0.0:
+            self.last_command_speed = requested_speed
+            return requested_speed
+
+        if requested_speed < self.last_command_speed:
+            self.last_command_speed = requested_speed
+            return requested_speed
+
+        if requested_speed > self.last_command_speed:
+            if self.last_command_speed <= self.CURVE_SPEED:
+                acceleration = self.SPEED_ACCEL_FROM_SHARP
+            elif self.last_command_speed <= self.MID_SPEED:
+                acceleration = self.SPEED_ACCEL_FROM_MID
+            else:
+                acceleration = self.SPEED_ACCEL_NORMAL
+            requested_speed = min(requested_speed, self.last_command_speed + acceleration)
+
+        self.last_command_speed = requested_speed
+        return requested_speed
 
     def front_obstacle_distance(self):
         if not self.lidar_ranges:
@@ -524,7 +777,13 @@ class TrackDriverNode(Node):
             (0, 255, 255),
             2,
         )
-        mode_text = f"mode={debug.get('mode')} err={debug.get('error', 0):.1f}"
+        mode_text = (
+            f"mode={debug.get('mode')} err={debug.get('error', 0):.1f} "
+            f"d={debug.get('d_term', 0.0):.1f} "
+            f"yellow={debug.get('valid_yellow_count', 0)} "
+            f"school={int(debug.get('school_zone_detected', False))} "
+            f"confirm={debug.get('sharp_confirm', 0)}/{self.WHITE_CURVE_ENTER_FRAMES}"
+        )
         if debug.get("virtual_kind"):
             mode_text += f" {debug['virtual_kind']}"
         cv2.putText(
@@ -535,6 +794,20 @@ class TrackDriverNode(Node):
             0.55,
             (0, 255, 255),
             2,
+        )
+        curve_text = (
+            f"geom={debug.get('curve_geometry')} "
+            f"head={debug.get('curve_heading', 0.0):.1f}/18,30 "
+            f"a={debug.get('curve_quadratic', 0.0):.4f}/.0015,.0040"
+        )
+        cv2.putText(
+            view,
+            curve_text,
+            (15, 88),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 255, 255),
+            1,
         )
         cv2.imshow("track_drive camera debug", view)
         cv2.imshow("yellow white sliding windows", self.make_window_debug(
@@ -562,6 +835,7 @@ class TrackDriverNode(Node):
             elif front_dist < 1.5:
                 speed = min(speed, 8.0)
 
+            speed = self.apply_speed_recovery_ramp(speed)
             self.drive(angle=angle, speed=speed)
 
             self.frame_count += 1

@@ -29,6 +29,33 @@ class TrackDriverNode(Node):
         self.MAX_SPEED = 100.0
         self.LIDAR_MIN_VALID = 0.35
 
+        # Startup cone corridor: the supplied LiDAR viewer uses +y as forward
+        # and x as lateral position. Cone navigation is completed once only.
+        self.CONE_MIN_RANGE = 0.50
+        self.CONE_MAX_RANGE = 5.0
+        self.CONE_MIN_FORWARD = 1.0
+        self.CONE_MAX_FORWARD = 8.0
+        self.CONE_MAX_LATERAL = 5.0
+        self.CONE_MIN_WIDTH = 1.4
+        self.CONE_MAX_WIDTH = 7.0
+        self.CONE_MAX_PAIR_Y_GAP = 1.6
+        self.CONE_ENTRY_FRAMES = 2
+        self.CONE_EXIT_FRAMES = 8
+        self.CONE_LANE_CONFIRM_FRAMES = 4
+        self.CONE_SEARCH_TIMEOUT_FRAMES = 60
+        self.CONE_SPEED = 8.0
+        self.CONE_KP = 85.0
+        self.CONE_MAX_ANGLE = 100.0
+        self.CONE_TARGET_ALPHA = 0.25
+        self.CONE_TARGET_MAX_STEP = 0.20
+        self.CONE_PAIR_MAX_CENTER_JUMP = 1.20
+        self.CONE_PAIR_MAX_WIDTH_DELTA = 1.20
+        self.CONE_PAIR_CENTER_WEIGHT = 4.0
+        self.CONE_PAIR_WIDTH_WEIGHT = 1.5
+        self.CONE_LOOKAHEAD_Y = 2.5
+        self.CONE_SIDE_X_WEIGHT = 1.5
+        self.CONE_SINGLE_MAX_TARGET_JUMP = 0.80
+
         # Yellow dashed centerline first, white solid-line fallback.
         self.KP = 0.58
         self.YELLOW_CENTER_KP = 0.25
@@ -89,6 +116,17 @@ class TrackDriverNode(Node):
         self.prev_white_curve_candidate_x = None
         self.fail_count = 0
         self.frame_count = 0
+
+        self.mission_mode = "cone_search"
+        self.cone_pair_confirm_count = 0
+        self.cone_missing_count = 0
+        self.yellow_handoff_confirm_count = 0
+        self.cone_search_frames = 0
+        self.cone_target_x = None
+        self.last_cone_width = None
+        self.last_cone_pair = None
+        self.cone_raw_beam_count = 0
+        self.cone_debug = {}
 
         self.show_debug = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
@@ -687,6 +725,277 @@ class TrackDriverNode(Node):
         self.last_command_speed = requested_speed
         return requested_speed
 
+    def lidar_cone_clusters(self):
+        """Return LiDAR obstacle clusters in the same coordinates as lidar_viewer.
+
+        The simulator scan is ordered with index zero at the forward direction.
+        The visualizer maps it to x=lateral and y=forward using this transform.
+        """
+        if not self.lidar_ranges:
+            self.cone_raw_beam_count = 0
+            return []
+
+        ranges = np.asarray(self.lidar_ranges, dtype=np.float32)
+        count = len(ranges)
+        if count == 0:
+            self.cone_raw_beam_count = 0
+            return []
+
+        indices = np.arange(count, dtype=np.float32)
+        angles = np.deg2rad(indices * (360.0 / count) - 90.0)
+        x_values = -ranges * np.cos(angles)
+        y_values = -ranges * np.sin(angles)
+        valid = (
+            np.isfinite(ranges) &
+            (ranges >= self.CONE_MIN_RANGE) &
+            (ranges <= self.CONE_MAX_RANGE) &
+            (y_values >= self.CONE_MIN_FORWARD) &
+            (y_values <= self.CONE_MAX_FORWARD) &
+            (np.abs(x_values) <= self.CONE_MAX_LATERAL)
+        )
+        self.cone_raw_beam_count = int(np.count_nonzero(valid))
+
+        clusters = []
+        active = []
+        previous_index = None
+        previous_point = None
+
+        def finish_cluster(points):
+            if not points:
+                return
+            points = np.asarray(points, dtype=np.float32)
+            clusters.append({
+                "x": float(np.median(points[:, 0])),
+                "y": float(np.median(points[:, 1])),
+                "beams": len(points),
+            })
+
+        for index in np.flatnonzero(valid):
+            point = (x_values[index], y_values[index])
+            adjacent = (
+                previous_index is not None and
+                index - previous_index <= 2 and
+                np.hypot(point[0] - previous_point[0], point[1] - previous_point[1]) <= 0.65
+            )
+            if active and not adjacent:
+                finish_cluster(active)
+                active = []
+            active.append(point)
+            previous_index = index
+            previous_point = point
+        finish_cluster(active)
+        return clusters
+
+    def select_cone_side(self, candidates, side):
+        """Pick one stable cone candidate for one vehicle side."""
+        if not candidates:
+            return None
+
+        expected_x = None
+        if self.cone_target_x is not None and self.last_cone_width is not None:
+            expected_x = self.cone_target_x + side * self.last_cone_width * 0.5
+
+        def score(point):
+            lookahead_error = abs(point["y"] - self.CONE_LOOKAHEAD_Y)
+            lateral_error = abs(point["x"] - expected_x) if expected_x is not None else 0.0
+            return lookahead_error + self.CONE_SIDE_X_WEIGHT * lateral_error
+
+        return min(candidates, key=score)
+
+    def make_single_side_corridor(self, point, side, clusters):
+        """Use one boundary only when its inferred center stays near the last path."""
+        if point is None or self.last_cone_width is None or self.cone_target_x is None:
+            return None
+
+        if side < 0:
+            left_point = point
+            right_point = {"x": point["x"] + self.last_cone_width, "y": point["y"], "beams": 0}
+            source = "left_only"
+        else:
+            right_point = point
+            left_point = {"x": point["x"] - self.last_cone_width, "y": point["y"], "beams": 0}
+            source = "right_only"
+
+        target_x = 0.5 * (left_point["x"] + right_point["x"])
+        center_jump = abs(target_x - self.cone_target_x)
+        if center_jump > self.CONE_SINGLE_MAX_TARGET_JUMP:
+            self.cone_debug["rejected_single"] += 1
+            return None
+
+        self.cone_debug.update({
+            "source": source,
+            "width": self.last_cone_width,
+            "raw_target_x": target_x,
+            "center_jump": center_jump,
+        })
+        return {
+            "left": left_point,
+            "right": right_point,
+            "width": self.last_cone_width,
+            "target_x": target_x,
+            "source": source,
+            "clusters": clusters,
+        }
+
+    def find_cone_corridor(self):
+        """Choose one left cone and one right cone before validating a corridor."""
+        clusters = self.lidar_cone_clusters()
+        left_candidates = [point for point in clusters if point["x"] < -0.25]
+        right_candidates = [point for point in clusters if point["x"] > 0.25]
+        left_point = self.select_cone_side(left_candidates, -1)
+        right_point = self.select_cone_side(right_candidates, +1)
+        previous_target_x = self.cone_target_x
+        previous_width = self.last_cone_width
+
+        self.cone_debug = {
+            "raw_beams": self.cone_raw_beam_count,
+            "clusters": clusters,
+            "left_count": len(left_candidates),
+            "right_count": len(right_candidates),
+            "pair_count": 0,
+            "rejected_width": 0,
+            "rejected_y_gap": 0,
+            "rejected_continuity": 0,
+            "rejected_single": 0,
+            "source": "none",
+        }
+
+        if left_point is not None and right_point is not None:
+            width = right_point["x"] - left_point["x"]
+            y_gap = abs(right_point["y"] - left_point["y"])
+            target_x = 0.5 * (left_point["x"] + right_point["x"])
+            center_jump = abs(target_x - previous_target_x) if previous_target_x is not None else 0.0
+            width_delta = abs(width - previous_width) if previous_width is not None else 0.0
+            valid_pair = True
+            if not (self.CONE_MIN_WIDTH <= width <= self.CONE_MAX_WIDTH):
+                self.cone_debug["rejected_width"] += 1
+                valid_pair = False
+            if y_gap > self.CONE_MAX_PAIR_Y_GAP:
+                self.cone_debug["rejected_y_gap"] += 1
+                valid_pair = False
+            if previous_target_x is not None and center_jump > self.CONE_PAIR_MAX_CENTER_JUMP:
+                self.cone_debug["rejected_continuity"] += 1
+                valid_pair = False
+            if previous_width is not None and width_delta > self.CONE_PAIR_MAX_WIDTH_DELTA:
+                self.cone_debug["rejected_continuity"] += 1
+                valid_pair = False
+
+            if valid_pair:
+                self.cone_debug["pair_count"] = 1
+                self.last_cone_width = width if previous_width is None else 0.80 * previous_width + 0.20 * width
+                pair = {
+                    "left": left_point,
+                    "right": right_point,
+                    "width": width,
+                    "target_x": target_x,
+                    "source": "pair",
+                    "clusters": clusters,
+                }
+                self.last_cone_pair = pair
+                self.cone_debug.update({
+                    "source": "pair",
+                    "width": width,
+                    "raw_target_x": target_x,
+                    "center_jump": center_jump,
+                    "width_delta": width_delta,
+                })
+                return pair
+
+        # Late in the cone course the right boundary can remain after the left disappears.
+        right_only = self.make_single_side_corridor(right_point, +1, clusters)
+        if right_only is not None:
+            return right_only
+        left_only = self.make_single_side_corridor(left_point, -1, clusters)
+        if left_only is not None:
+            return left_only
+        return None
+
+    def reset_lane_control_state(self):
+        self.prev_yellow_control_error = None
+        self.filtered_yellow_error_delta = 0.0
+        self.last_angle = 0.0
+
+    def update_mission_mode(self, yellow_fit):
+        """Advance from the startup cones to lane following only after yellow confirmation."""
+        corridor = self.find_cone_corridor()
+        has_full_cone_pair = corridor is not None and corridor["source"] == "pair"
+        has_cone_guidance = corridor is not None
+        yellow_visible = yellow_fit is not None
+
+        if self.mission_mode == "cone_search":
+            self.cone_search_frames += 1
+            if has_full_cone_pair:
+                self.cone_pair_confirm_count += 1
+                if self.cone_pair_confirm_count >= self.CONE_ENTRY_FRAMES:
+                    self.mission_mode = "cone_nav"
+                    self.cone_missing_count = 0
+                    self.yellow_handoff_confirm_count = 0
+            else:
+                self.cone_pair_confirm_count = 0
+                if yellow_visible and self.cone_search_frames >= self.CONE_SEARCH_TIMEOUT_FRAMES:
+                    self.yellow_handoff_confirm_count += 1
+                    if self.yellow_handoff_confirm_count >= self.CONE_LANE_CONFIRM_FRAMES:
+                        self.mission_mode = "lane_follow"
+                        self.reset_lane_control_state()
+                else:
+                    self.yellow_handoff_confirm_count = 0
+
+        elif self.mission_mode == "cone_nav":
+            if has_cone_guidance:
+                self.cone_missing_count = 0
+                self.yellow_handoff_confirm_count = 0
+            else:
+                self.mission_mode = "cone_exit_confirm"
+                self.cone_missing_count = 1
+                self.yellow_handoff_confirm_count = 1 if yellow_visible else 0
+
+        elif self.mission_mode == "cone_exit_confirm":
+            if has_cone_guidance:
+                self.mission_mode = "cone_nav"
+                self.cone_missing_count = 0
+                self.yellow_handoff_confirm_count = 0
+            else:
+                self.cone_missing_count += 1
+                self.yellow_handoff_confirm_count = (
+                    self.yellow_handoff_confirm_count + 1 if yellow_visible else 0
+                )
+                if (self.cone_missing_count >= self.CONE_EXIT_FRAMES and
+                        self.yellow_handoff_confirm_count >= self.CONE_LANE_CONFIRM_FRAMES):
+                    self.mission_mode = "lane_follow"
+                    self.cone_target_x = None
+                    self.reset_lane_control_state()
+
+        return corridor
+
+    def cone_control(self, corridor):
+        """Steer toward the LiDAR corridor midpoint while limiting target jumps."""
+        if corridor is None:
+            return self.last_angle, min(self.CONE_SPEED, 6.0)
+
+        raw_target_x = float(corridor["target_x"])
+        if self.cone_target_x is None:
+            self.cone_target_x = raw_target_x
+        else:
+            delta = float(np.clip(
+                raw_target_x - self.cone_target_x,
+                -self.CONE_TARGET_MAX_STEP,
+                self.CONE_TARGET_MAX_STEP,
+            ))
+            self.cone_target_x += self.CONE_TARGET_ALPHA * delta
+
+        raw_angle = float(np.clip(
+            self.CONE_KP * self.cone_target_x,
+            -self.CONE_MAX_ANGLE,
+            self.CONE_MAX_ANGLE,
+        ))
+        angle_delta = float(np.clip(raw_angle - self.last_angle, -80.0, 80.0))
+        angle = float(np.clip(self.last_angle + angle_delta, -self.MAX_ANGLE, self.MAX_ANGLE))
+        self.last_angle = angle
+        self.prev_yellow_control_error = None
+        self.filtered_yellow_error_delta = 0.0
+        speed = self.CONE_SPEED if corridor["source"] == "pair" else min(self.CONE_SPEED, 6.0)
+        return angle, speed
+
     def front_obstacle_distance(self):
         if not self.lidar_ranges:
             return math.inf
@@ -695,9 +1004,13 @@ class TrackDriverNode(Node):
         if not np.any(np.isfinite(ranges)):
             return math.inf
 
-        center = len(ranges) // 2
+        # The supplied LiDAR viewer uses index 0 as forward; its forward wedge
+        # wraps around the beginning/end of the scan rather than the midpoint.
         half_width = max(8, len(ranges) // 36)
-        indices = np.arange(center - half_width, center + half_width + 1) % len(ranges)
+        indices = np.concatenate((
+            np.arange(0, half_width + 1),
+            np.arange(len(ranges) - half_width, len(ranges)),
+        ))
         front_values = ranges[indices]
         front_values = front_values[np.isfinite(front_values)]
         front_values = front_values[front_values > self.LIDAR_MIN_VALID]
@@ -746,6 +1059,48 @@ class TrackDriverNode(Node):
                 cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
         return debug
 
+    def draw_cone_lidar_inset(self, view, cone_debug, corridor):
+        """Draw a compact top-down LiDAR view in the existing camera window."""
+        height, width = view.shape[:2]
+        map_width = min(220, max(160, width // 3))
+        map_height = min(175, max(125, height // 3))
+        left = width - map_width - 10
+        top = height - map_height - 10
+        cv2.rectangle(view, (left, top), (left + map_width, top + map_height), (35, 35, 35), -1)
+        cv2.rectangle(view, (left, top), (left + map_width, top + map_height), (0, 255, 255), 1)
+
+        origin_x = left + map_width // 2
+        origin_y = top + map_height - 10
+        scale = min((map_width - 20) / (2.0 * self.CONE_MAX_LATERAL),
+                    (map_height - 20) / self.CONE_MAX_FORWARD)
+        cv2.line(view, (origin_x, top + 5), (origin_x, origin_y), (90, 90, 90), 1)
+        cv2.line(view, (left + 5, origin_y), (left + map_width - 5, origin_y), (90, 90, 90), 1)
+        cv2.arrowedLine(view, (origin_x, origin_y), (origin_x, origin_y - 25), (0, 0, 255), 2)
+
+        def point_to_pixel(point):
+            px = int(np.clip(origin_x + point["x"] * scale, left + 3, left + map_width - 3))
+            py = int(np.clip(origin_y - point["y"] * scale, top + 3, origin_y))
+            return px, py
+
+        for point in cone_debug.get("clusters", []):
+            cv2.circle(view, point_to_pixel(point), 4, (210, 210, 210), -1)
+
+        if corridor is not None:
+            left_point = point_to_pixel(corridor["left"])
+            right_point = point_to_pixel(corridor["right"])
+            target = {
+                "x": corridor["target_x"],
+                "y": 0.5 * (corridor["left"]["y"] + corridor["right"]["y"]),
+            }
+            target_point = point_to_pixel(target)
+            cv2.circle(view, left_point, 6, (0, 255, 0), -1)
+            cv2.circle(view, right_point, 6, (0, 165, 255), -1)
+            cv2.circle(view, target_point, 5, (0, 0, 255), -1)
+            cv2.line(view, (origin_x, origin_y), target_point, (0, 0, 255), 2)
+
+        cv2.putText(view, "LiDAR cone map", (left + 6, top + 17),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
     def show_debug_image(self, image, debug, angle, speed, front_dist):
         if not self.show_debug:
             return
@@ -778,11 +1133,9 @@ class TrackDriverNode(Node):
             2,
         )
         mode_text = (
-            f"mode={debug.get('mode')} err={debug.get('error', 0):.1f} "
-            f"d={debug.get('d_term', 0.0):.1f} "
-            f"yellow={debug.get('valid_yellow_count', 0)} "
-            f"school={int(debug.get('school_zone_detected', False))} "
-            f"confirm={debug.get('sharp_confirm', 0)}/{self.WHITE_CURVE_ENTER_FRAMES}"
+            f"mission={debug.get('mission_mode', 'lane_follow')} lane={debug.get('mode')} "
+            f"err={debug.get('error', 0):.1f} d={debug.get('d_term', 0.0):.1f} "
+            f"yellow={debug.get('valid_yellow_count', 0)}"
         )
         if debug.get("virtual_kind"):
             mode_text += f" {debug['virtual_kind']}"
@@ -795,11 +1148,35 @@ class TrackDriverNode(Node):
             (0, 255, 255),
             2,
         )
-        curve_text = (
-            f"geom={debug.get('curve_geometry')} "
-            f"head={debug.get('curve_heading', 0.0):.1f}/18,30 "
-            f"a={debug.get('curve_quadratic', 0.0):.4f}/.0015,.0040"
-        )
+        if debug.get("mission_mode", "") in ("cone_search", "cone_nav", "cone_exit_confirm"):
+            cone_debug = debug.get("cone_debug", {})
+            curve_text = (
+                f"cone={debug.get('cone_source', 'none')} "
+                f"raw/filt={cone_debug.get('raw_target_x', 0.0):+.2f}/"
+                f"{debug.get('cone_target_x', 0.0):+.2f}m "
+                f"pair={debug.get('cone_pair_confirm', 0)}/{self.CONE_ENTRY_FRAMES} "
+                f"exit={debug.get('cone_missing', 0)}/{self.CONE_EXIT_FRAMES} "
+                f"yellow={debug.get('yellow_handoff_confirm', 0)}/{self.CONE_LANE_CONFIRM_FRAMES}"
+            )
+            diagnostic_text = (
+                f"lidar beams={cone_debug.get('raw_beams', 0)} clusters="
+                f"{len(cone_debug.get('clusters', []))} L/R="
+                f"{cone_debug.get('left_count', 0)}/{cone_debug.get('right_count', 0)} "
+                f"pairs={cone_debug.get('pair_count', 0)} reject(w/dy/c)="
+                f"{cone_debug.get('rejected_width', 0)}/"
+                f"{cone_debug.get('rejected_y_gap', 0)}/"
+                f"{cone_debug.get('rejected_continuity', 0)} "
+                f"single_reject={cone_debug.get('rejected_single', 0)} "
+                f"width={cone_debug.get('width', 0.0):.2f}"
+            )
+            self.draw_cone_lidar_inset(view, cone_debug, debug.get("cone_corridor"))
+        else:
+            diagnostic_text = ""
+            curve_text = (
+                f"geom={debug.get('curve_geometry')} "
+                f"head={debug.get('curve_heading', 0.0):.1f}/18,30 "
+                f"a={debug.get('curve_quadratic', 0.0):.4f}/.0015,.0040"
+            )
         cv2.putText(
             view,
             curve_text,
@@ -809,6 +1186,16 @@ class TrackDriverNode(Node):
             (0, 255, 255),
             1,
         )
+        if diagnostic_text:
+            cv2.putText(
+                view,
+                diagnostic_text,
+                (15, 112),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (0, 255, 255),
+                1,
+            )
         cv2.imshow("track_drive camera debug", view)
         cv2.imshow("yellow white sliding windows", self.make_window_debug(
             debug["yellow_mask"], debug["white_mask"], debug["yellow_lanes"], debug["white_lanes"]))
@@ -827,8 +1214,53 @@ class TrackDriverNode(Node):
                 time.sleep(0.03)
                 continue
 
-            angle, speed, debug = self.decide_control(self.image)
+            lane_angle, lane_speed, debug = self.decide_control(self.image)
+            corridor = self.update_mission_mode(debug.get("yellow_fit"))
+            debug.update({
+                "mission_mode": self.mission_mode,
+                "cone_pair_confirm": self.cone_pair_confirm_count,
+                "cone_missing": self.cone_missing_count,
+                "yellow_handoff_confirm": self.yellow_handoff_confirm_count,
+                "cone_source": corridor["source"] if corridor is not None else "none",
+                "cone_target_x": self.cone_target_x if self.cone_target_x is not None else 0.0,
+                "cone_corridor": corridor,
+                "cone_debug": dict(self.cone_debug),
+            })
+
+            if self.mission_mode in ("cone_nav", "cone_exit_confirm"):
+                angle, speed = self.cone_control(corridor)
+            elif self.mission_mode == "cone_search":
+                # Wait for a stable left/right pair before leaving the start line.
+                angle, speed = 0.0, 0.0
+            else:
+                angle, speed = lane_angle, lane_speed
+
+            debug["cone_target_x"] = self.cone_target_x if self.cone_target_x is not None else 0.0
             front_dist = self.front_obstacle_distance()
+
+            if self.frame_count % 15 == 0 and self.mission_mode != "lane_follow":
+                cone_debug = debug["cone_debug"]
+                self.get_logger().info(
+                    "cone state=%s source=%s beams=%d clusters=%d L/R=%d/%d pairs=%d "
+                    "reject_w/dy/c=%d/%d/%d raw_x=%+.2f filt_x=%+.2f jump=%+.2f width_d=%+.2f exit=%d yellow=%d" % (
+                        self.mission_mode,
+                        debug["cone_source"],
+                        cone_debug.get("raw_beams", 0),
+                        len(cone_debug.get("clusters", [])),
+                        cone_debug.get("left_count", 0),
+                        cone_debug.get("right_count", 0),
+                        cone_debug.get("pair_count", 0),
+                        cone_debug.get("rejected_width", 0),
+                        cone_debug.get("rejected_y_gap", 0),
+                        cone_debug.get("rejected_continuity", 0),
+                        cone_debug.get("raw_target_x", 0.0),
+                        debug["cone_target_x"],
+                        cone_debug.get("center_jump", 0.0),
+                        cone_debug.get("width_delta", 0.0),
+                        self.cone_missing_count,
+                        self.yellow_handoff_confirm_count,
+                    )
+                )
 
             if front_dist < 0.8:
                 angle, speed = 0.0, 0.0

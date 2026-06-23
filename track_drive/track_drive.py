@@ -4,6 +4,7 @@
 import math
 import os
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -83,7 +84,7 @@ class TrackDriverNode(Node):
 
         # Yellow dashed centerline first, white solid-line fallback.
         self.KP = 0.58
-        self.YELLOW_CENTER_KP = 0.25
+        self.YELLOW_CENTER_KP = 0.20
         self.YELLOW_D_GAIN = 0.55
         self.YELLOW_D_FILTER_ALPHA = 0.18
         self.YELLOW_D_MAX = 18.0
@@ -131,6 +132,10 @@ class TrackDriverNode(Node):
         self.YELLOW_BASE_CONTINUITY_PX = 80.0
         self.YELLOW_HOLD_FRAMES = 3
         self.YELLOW_STRAIGHT_MAX_ANGLE_DELTA = 10.0
+        self.STRAIGHT_ERROR_HISTORY_FRAMES = 5
+        self.STRAIGHT_ERROR_SLOW_THRESHOLD = 35.0
+        self.STRAIGHT_ERROR_MID_THRESHOLD = 80.0
+        self.STRAIGHT_ERROR_SLOW_SPEED = 17.0
 
         self.yellow_fit = None
         self.white_fit = None
@@ -139,6 +144,7 @@ class TrackDriverNode(Node):
         self.last_command_speed = 0.0
         self.prev_yellow_control_error = None
         self.filtered_yellow_error_delta = 0.0
+        self.straight_error_history = deque(maxlen=self.STRAIGHT_ERROR_HISTORY_FRAMES)
         self.yellow_hold_remaining = 0
         self.yellow_hold_active = False
         self.yellow_jump_active = False
@@ -1093,6 +1099,24 @@ class TrackDriverNode(Node):
             return self.MID_SPEED
         return self.BASE_SPEED
 
+    def apply_straight_error_speed(self, requested_speed, error, mode, yellow_straight):
+        """Slow a straight yellow-center pass only while its lateral error is large."""
+        if mode != "yellow_center" or not yellow_straight:
+            self.straight_error_history.clear()
+            return requested_speed, 0.0, "off"
+
+        self.straight_error_history.append(abs(error))
+        average_error = float(np.mean(self.straight_error_history))
+        if average_error > self.STRAIGHT_ERROR_MID_THRESHOLD:
+            return min(requested_speed, self.MID_SPEED), average_error, "mid"
+        if average_error > self.STRAIGHT_ERROR_SLOW_THRESHOLD:
+            return (
+                min(requested_speed, self.STRAIGHT_ERROR_SLOW_SPEED),
+                average_error,
+                "slow",
+            )
+        return requested_speed, average_error, "base"
+
     def decide_control(self, image):
         height, width = image.shape[:2]
         yellow_mask, white_mask, roi_polygon, top_y, bottom_y = self.make_lane_masks(image)
@@ -1188,6 +1212,7 @@ class TrackDriverNode(Node):
             self.last_angle = 0.0
             self.prev_yellow_control_error = None
             self.filtered_yellow_error_delta = 0.0
+            self.straight_error_history.clear()
             self.yellow_hold_remaining = 0
             self.yellow_hold_active = False
             self.yellow_jump_active = False
@@ -1215,6 +1240,8 @@ class TrackDriverNode(Node):
         )
         angle, d_term = self.p_control(error, mode, angle_delta_limit)
         speed = self.select_speed(angle, mode)
+        speed, straight_error_average, straight_speed_mode = self.apply_straight_error_speed(
+            speed, error, mode, yellow_straight)
 
         debug.update({
             "center_fit": self.center_fit,
@@ -1237,6 +1264,8 @@ class TrackDriverNode(Node):
             "yellow_held": yellow_held,
             "yellow_hold_remaining": self.yellow_hold_remaining,
             "yellow_straight_limiter": yellow_straight,
+            "straight_error_average": straight_error_average,
+            "straight_speed_mode": straight_speed_mode,
             "white_pair": white_pair,
             "white_pair_confirm": self.white_pair_confirm_count,
             "mode": mode,
@@ -1698,6 +1727,8 @@ class TrackDriverNode(Node):
             f"hold={int(debug.get('yellow_held', False))}/"
             f"{debug.get('yellow_hold_remaining', 0)} "
             f"lim={int(debug.get('yellow_straight_limiter', False))} "
+            f"erravg={debug.get('straight_error_average', 0.0):.1f} "
+            f"spd={debug.get('straight_speed_mode', 'off')} "
             f"wpair={debug.get('white_pair_confirm', 0)}/{self.WHITE_PAIR_CONFIRM_FRAMES}"
         )
         if debug.get("virtual_kind"):
